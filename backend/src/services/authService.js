@@ -108,7 +108,7 @@ class AuthService {
     return { user: safeUser, business, accessToken, refreshToken };
   }
 
-  // Google Login
+  // Google Login (with auto-registration)
   async googleLogin({ token }) {
     const { OAuth2Client } = require('google-auth-library');
     const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -121,26 +121,60 @@ class AuthService {
     const payload = ticket.getPayload();
     
     // Find user
-    const { data: user, error } = await supabase
+    let { data: user, error } = await supabase
       .from('users')
       .select('id, email, full_name, role, business_id, is_active')
       .eq('email', payload.email)
-      .single();
+      .maybeSingle();
 
-    if (error || !user) {
-      throw new AppError('No account found with this email. Please register or get invited first.', 404);
+    let business;
+
+    // If user doesn't exist, create one (Auto-Sign Up)
+    if (!user) {
+      // Create a default business for the new Google user
+      const { data: newBiz, error: bizError } = await supabase
+        .from('businesses')
+        .insert({ 
+          name: `${payload.name}'s Organization`, 
+          industry: 'General' 
+        })
+        .select()
+        .single();
+
+      if (bizError) throw new AppError('Failed to auto-create business: ' + bizError.message);
+      business = newBiz;
+
+      // Create the user
+      const { data: newUser, error: userError } = await supabase
+        .from('users')
+        .insert({
+          business_id: business.id,
+          email: payload.email,
+          password_hash: 'GOOGLE_AUTH_NO_PASSWORD', // Security: User must use Google to login
+          full_name: payload.name,
+          role: 'manager',
+          avatar_url: payload.picture
+        })
+        .select('id, email, full_name, role, business_id, is_active')
+        .single();
+
+      if (userError) {
+        throw new AppError('Failed to auto-create user: ' + userError.message);
+      }
+      user = newUser;
+    } else {
+      if (!user.is_active) {
+        throw new AppError('Account deactivated', 403);
+      }
+
+      // Get existing business
+      const { data: existingBiz } = await supabase
+        .from('businesses')
+        .select('id, name')
+        .eq('id', user.business_id)
+        .single();
+      business = existingBiz;
     }
-
-    if (!user.is_active) {
-      throw new AppError('Account deactivated', 403);
-    }
-
-    // Get business
-    const { data: business } = await supabase
-      .from('businesses')
-      .select('id, name')
-      .eq('id', user.business_id)
-      .single();
 
     // Generate tokens
     const accessToken = generateAccessToken(user);
